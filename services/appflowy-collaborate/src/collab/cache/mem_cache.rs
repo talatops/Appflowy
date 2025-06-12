@@ -1,0 +1,377 @@
+use crate::collab::cache::encode_collab_from_bytes;
+use crate::CollabMetrics;
+use anyhow::anyhow;
+use app_error::AppError;
+use appflowy_proto::Rid;
+use collab::entity::EncodedCollab;
+use collab_entity::CollabType;
+use collab_stream::model::UpdateStreamMessage;
+use collab_stream::stream_router::FromRedisStream;
+use database::collab::CollabMetadata;
+use redis::streams::StreamRangeReply;
+use redis::{pipe, AsyncCommands, FromRedisValue};
+use std::sync::Arc;
+use tracing::{error, instrument, trace};
+use uuid::Uuid;
+
+const SEVEN_DAYS: u64 = 604800;
+const ONE_MONTH: u64 = 2592000;
+
+/// Threshold for spawning blocking tasks for encoding operations.
+/// Data smaller than this will be processed on the current thread for efficiency.
+/// Data larger than this will be spawned to avoid blocking the current thread.
+const ENCODE_SPAWN_THRESHOLD: usize = 4096; // 4KB
+
+#[derive(Clone)]
+pub struct CollabMemCache {
+  connection_manager: redis::aio::ConnectionManager,
+  metrics: Arc<CollabMetrics>,
+}
+
+impl CollabMemCache {
+  pub fn new(
+    connection_manager: redis::aio::ConnectionManager,
+    metrics: Arc<CollabMetrics>,
+  ) -> Self {
+    Self {
+      connection_manager,
+      metrics,
+    }
+  }
+
+  pub async fn insert_collab_meta(&self, meta: CollabMetadata) -> Result<(), AppError> {
+    let key = collab_meta_key(&meta.object_id);
+    let value = serde_json::to_string(&meta)?;
+    let () = self
+      .connection_manager
+      .clone()
+      .set_ex(key, value, ONE_MONTH)
+      .await
+      .map_err(|err| AppError::Internal(anyhow!("Failed to save collab meta to redis: {}", err)))?;
+    Ok(())
+  }
+
+  pub async fn get_collab_meta(&self, object_id: &Uuid) -> Result<CollabMetadata, AppError> {
+    let key = collab_meta_key(object_id);
+    let value: Option<String> = self
+      .connection_manager
+      .clone()
+      .get(key)
+      .await
+      .map_err(|err| {
+        AppError::Internal(anyhow!("Failed to get collab meta from redis: {}", err))
+      })?;
+    match value {
+      Some(value) => {
+        let meta: CollabMetadata = serde_json::from_str(&value)?;
+        Ok(meta)
+      },
+      None => Err(AppError::RecordNotFound(format!(
+        "Collab meta not found for object_id: {}",
+        object_id
+      ))),
+    }
+  }
+
+  /// Checks if an object with the given ID exists in the cache.
+  pub async fn is_exist(&self, object_id: &Uuid) -> Result<bool, AppError> {
+    let cache_object_id = encode_collab_key(object_id);
+    let exists: bool = self
+      .connection_manager
+      .clone()
+      .exists(&cache_object_id)
+      .await
+      .map_err(|err| AppError::Internal(err.into()))?;
+    Ok(exists)
+  }
+
+  pub async fn remove_encode_collab(&self, object_id: &Uuid) -> Result<(), AppError> {
+    trace!("Removing encode collab from cache: {}", object_id);
+    let cache_object_id = encode_collab_key(object_id);
+    self
+      .connection_manager
+      .clone()
+      .del::<&str, ()>(&cache_object_id)
+      .await
+      .map_err(|err| {
+        AppError::Internal(anyhow!(
+          "Failed to remove encoded collab from redis: {}",
+          err
+        ))
+      })
+  }
+
+  #[instrument(level = "trace", skip_all)]
+  pub async fn get_encode_collab(&self, object_id: &Uuid) -> Option<(Rid, EncodedCollab)> {
+    match self.get_data_with_timestamp(object_id).await {
+      Ok(Some((timestamp, bytes))) => {
+        let encoded_collab = encode_collab_from_bytes(bytes).await.ok()?;
+        let rid = Rid::new(timestamp, 0);
+        Some((rid, encoded_collab))
+      },
+      Ok(None) => None,
+      Err(err) => {
+        error!("Failed to get encoded collab from redis: {}", err);
+        None
+      },
+    }
+  }
+
+  /// Retrieves a range of updates from the Redis stream for a given workspace ID.
+  pub async fn get_workspace_updates(
+    &self,
+    workspace_id: &Uuid,
+    object_id: Option<&Uuid>,
+    from: Option<Rid>,
+    to: Option<Rid>,
+  ) -> Result<Vec<UpdateStreamMessage>, AppError> {
+    let key = UpdateStreamMessage::stream_key(workspace_id);
+    let from = from
+      .map(|rid| rid.to_string())
+      .unwrap_or_else(|| "-".into());
+    let to = to.map(|rid| rid.to_string()).unwrap_or_else(|| "+".into());
+    let mut conn = self.connection_manager.clone();
+    let updates: StreamRangeReply = conn
+      .xrange(key, from, to)
+      .await
+      .map_err(|err| AppError::Internal(err.into()))?;
+    let mut result = Vec::with_capacity(updates.ids.len());
+    for stream_id in updates.ids {
+      if let Some(object_id) = object_id {
+        let msg_oid = stream_id
+          .map
+          .get("oid")
+          .and_then(|v| Uuid::from_redis_value(v).ok())
+          .unwrap_or_default();
+        if &msg_oid != object_id {
+          continue; // this is not the object we are looking for
+        }
+      }
+      let message = UpdateStreamMessage::from_redis_stream(&stream_id.id, &stream_id.map)?;
+      result.push(message);
+    }
+    Ok(result)
+  }
+
+  #[instrument(level = "trace", skip_all, fields(object_id=%object_id))]
+  pub async fn insert_encode_collab(
+    &self,
+    object_id: &Uuid,
+    encoded_collab: EncodedCollab,
+    timestamp: u64,
+    expiration_seconds: u64,
+  ) {
+    trace!("Inserting encode collab into cache: {}", object_id);
+
+    // Estimate the size of the encoded data to decide whether to spawn a blocking task
+    let estimated_size = encoded_collab.state_vector.len() + encoded_collab.doc_state.len();
+
+    let bytes_result = if estimated_size <= ENCODE_SPAWN_THRESHOLD {
+      // For small data, encode on current thread for efficiency
+      encoded_collab.encode_to_bytes()
+    } else {
+      // For large data, spawn a blocking task to avoid blocking current thread
+      match tokio::task::spawn_blocking(move || encoded_collab.encode_to_bytes()).await {
+        Ok(result) => result,
+        Err(e) => {
+          error!("Failed to spawn blocking task for encoding: {}", e);
+          return;
+        },
+      }
+    };
+
+    match bytes_result {
+      Ok(bytes) => {
+        if let Err(err) = self
+          .insert_data_with_timestamp(
+            object_id,
+            &bytes,
+            timestamp as i64,
+            Some(expiration_seconds),
+          )
+          .await
+        {
+          error!("Failed to cache encoded collab: {}", err);
+        }
+      },
+      Err(err) => {
+        error!("Failed to encode collab to bytes: {}", err);
+      },
+    }
+  }
+
+  /// Inserts data into Redis with a conditional timestamp.
+  /// if the expiration_seconds is None, the data will be expired after 7 days.
+  pub async fn insert_encode_collab_data(
+    &self,
+    object_id: &Uuid,
+    data: &[u8],
+    timestamp: i64,
+    expiration_seconds: Option<u64>,
+  ) -> redis::RedisResult<()> {
+    trace!(
+      "insert collab {}, data:{} to memory cache at {}",
+      object_id,
+      data.len(),
+      timestamp
+    );
+    self
+      .insert_data_with_timestamp(object_id, data, timestamp, expiration_seconds)
+      .await
+  }
+
+  /// Inserts data into Redis with a conditional timestamp.
+  ///
+  /// inserts data associated with an `object_id` into Redis only if the new timestamp is greater than the timestamp
+  /// currently stored in Redis for the same `object_id`. It uses Redis transactions to ensure that the operation is atomic.
+  /// the data will be expired after 7 days.
+  ///
+  /// # Arguments
+  /// * `object_id` - A string identifier for the data object.
+  /// * `data` - The binary data to be stored.
+  /// * `timestamp` - A unix timestamp indicating the creation time of the data.
+  ///
+  /// # Returns
+  /// A Redis result indicating the success or failure of the operation.
+  async fn insert_data_with_timestamp(
+    &self,
+    object_id: &Uuid,
+    data: &[u8],
+    timestamp: i64,
+    expiration_seconds: Option<u64>,
+  ) -> redis::RedisResult<()> {
+    let cache_object_id = encode_collab_key(object_id);
+    let mut conn = self.connection_manager.clone();
+    let key_exists: bool = conn.exists(&cache_object_id).await?;
+    // Start a watch on the object_id to monitor for changes during this transaction
+    if key_exists {
+      // WATCH command is used to monitor one or more keys for modifications, establishing a condition
+      // for executing a subsequent transaction (with MULTI/EXEC). If any of the watched keys are
+      // altered by another client before the current client executes EXEC, the transaction will be
+      // aborted by Redis (the EXEC will return nil indicating the transaction was not processed).
+      let _: redis::Value = redis::cmd("WATCH")
+        .arg(&cache_object_id)
+        .query_async(&mut conn)
+        .await?;
+    }
+
+    let result = async {
+      // Retrieve the current data, if exists
+      let current_value: Option<(i64, Vec<u8>)> = if key_exists {
+        let val: Option<Vec<u8>> = conn.get(&cache_object_id).await?;
+        val.and_then(|data| {
+          if data.len() < 8 {
+            None
+          } else {
+            match data[0..8].try_into() {
+              Ok(ts_bytes) => {
+                let ts = i64::from_be_bytes(ts_bytes);
+                Some((ts, data[8..].to_vec()))
+              },
+              Err(_) => None,
+            }
+          }
+        })
+      } else {
+        None
+      };
+
+      // Perform update only if the new timestamp is greater than the existing one
+      if current_value
+        .as_ref()
+        .is_none_or(|(ts, _)| timestamp >= *ts)
+      {
+        let mut pipeline = pipe();
+        let data = [timestamp.to_be_bytes().as_ref(), data].concat();
+        pipeline
+            .atomic()
+            .set(&cache_object_id, data)
+            .ignore()
+            .expire(&cache_object_id, expiration_seconds.unwrap_or(SEVEN_DAYS) as i64) // Setting the expiration to 7 days
+            .ignore();
+        let () = pipeline.query_async(&mut conn).await?;
+      }
+      Ok::<(), redis::RedisError>(())
+    }
+    .await;
+
+    // Always reset Watch State
+    let _: redis::Value = redis::cmd("UNWATCH").query_async(&mut conn).await?;
+
+    self.metrics.redis_write_collab_count.inc();
+    result
+  }
+
+  /// Retrieves data and its associated timestamp from Redis for a given object identifier.
+  ///
+  /// # Arguments
+  /// * `object_id` - A unique identifier for the data.
+  ///
+  /// # Returns
+  /// A `RedisResult<Option<(i64, Vec<u8>)>>` where:
+  /// - `i64` is the timestamp of the data.
+  /// - `Vec<u8>` is the binary data.
+  ///
+  /// The function returns `Ok(None)` if no data is found for the given `object_id`.
+  pub async fn get_data_with_timestamp(
+    &self,
+    object_id: &Uuid,
+  ) -> redis::RedisResult<Option<(u64, Vec<u8>)>> {
+    let cache_object_id = encode_collab_key(object_id);
+    let mut conn = self.connection_manager.clone();
+    // Attempt to retrieve the data from Redis
+    if let Some(data) = conn.get::<_, Option<Vec<u8>>>(&cache_object_id).await? {
+      if data.len() < 8 {
+        // Data is too short to contain a valid timestamp and payload
+        Err(redis::RedisError::from((
+          redis::ErrorKind::TypeError,
+          "Data corruption: stored data is too short to contain a valid timestamp.",
+        )))
+      } else {
+        // Extract timestamp and payload from the retrieved data
+        match data[0..8].try_into() {
+          Ok(ts_bytes) => {
+            self.metrics.redis_read_collab_count.inc();
+            let timestamp = i64::from_be_bytes(ts_bytes);
+            let payload = data[8..].to_vec();
+            Ok(Some((timestamp as u64, payload)))
+          },
+          Err(_) => Err(redis::RedisError::from((
+            redis::ErrorKind::TypeError,
+            "Failed to decode timestamp",
+          ))),
+        }
+      }
+    } else {
+      // No data found for the provided object_id
+      Ok(None)
+    }
+  }
+}
+
+/// Generates a cache-specific key for an object ID by prepending a fixed prefix.
+/// This method ensures that any updates to the object's data involve merely
+/// changing the prefix, allowing the old data to expire naturally.
+///
+#[inline]
+fn encode_collab_key(object_id: &Uuid) -> String {
+  format!("encode_collab_v0:{}", object_id)
+}
+
+#[inline]
+fn collab_meta_key(object_id: &Uuid) -> String {
+  format!("collab_meta_v0:{}", object_id)
+}
+
+#[inline]
+pub fn cache_exp_secs_from_collab_type(collab_type: &CollabType) -> u64 {
+  match collab_type {
+    CollabType::Document => SEVEN_DAYS * 2,
+    CollabType::Database => SEVEN_DAYS * 2,
+    CollabType::WorkspaceDatabase => ONE_MONTH,
+    CollabType::Folder => SEVEN_DAYS,
+    CollabType::DatabaseRow => SEVEN_DAYS,
+    CollabType::UserAwareness => SEVEN_DAYS * 2,
+    CollabType::Unknown => SEVEN_DAYS,
+  }
+}
