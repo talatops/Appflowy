@@ -33,11 +33,22 @@ jobs:
 
       - name: Copy repository to server
         run: |
-          # Create directory if it doesn't exist
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
-          
-          # Copy entire repository and .env file
-          rsync -av --delete -e "ssh -i ~/.ssh/id_rsa" ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          # Create archive of the repository
+          tar czf /tmp/appflowy.tar.gz .
+
+          # Create directory and set permissions on server
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          mkdir -p ${{ env.REMOTE_DIR }}
+          rm -rf ${{ env.REMOTE_DIR }}/*
+          ENDSSH
+
+          # Copy and extract archive
+          scp -i ~/.ssh/id_rsa /tmp/appflowy.tar.gz ubuntu@${{ secrets.EC2_HOST }}:/tmp/
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          cd ${{ env.REMOTE_DIR }}
+          tar xzf /tmp/appflowy.tar.gz
+          rm /tmp/appflowy.tar.gz
+          ENDSSH
 
       - name: Deploy
         run: |
@@ -70,3 +81,4 @@ jobs:
         run: |
           rm -f ~/.ssh/id_rsa
           rm -f .env
+          rm -f /tmp/appflowy.tar.gz
