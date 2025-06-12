@@ -22,53 +22,71 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Setup remote environment
+      - name: Setup remote directory
         run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          # Create directory with proper permissions
           sudo rm -rf ${{ env.REMOTE_DIR }}
           sudo mkdir -p ${{ env.REMOTE_DIR }}
           sudo chown ubuntu:ubuntu ${{ env.REMOTE_DIR }}
+          ENDSSH
+
+      - name: Copy repository
+        run: |
+          # Create and copy environment file
+          echo "${{ secrets.EC2_ENV }}" > .env
+
+          # Copy all directories and files
+          scp -i ~/.ssh/id_rsa -r \
+            admin_frontend \
+            assets \
+            docker \
+            email_template \
+            libs \
+            nginx \
+            services \
+            src \
+            tests \
+            docker-compose.yml \
+            Dockerfile \
+            .env \
+            Cargo.toml \
+            Cargo.lock \
+            ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+
+      - name: Set permissions
+        run: |
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          cd ${{ env.REMOTE_DIR }}
           
+          # Set proper permissions
+          sudo chown -R ubuntu:ubuntu .
+          sudo chmod -R 755 .
+          sudo chmod 600 .env
+          sudo chmod -R 600 nginx/ssl
+
           # Setup docker
           sudo groupadd -f docker
           sudo usermod -aG docker ubuntu
           sudo chmod 666 /var/run/docker.sock
           ENDSSH
 
-      - name: Copy files
-        run: |
-          # Copy project files
-          scp -i ~/.ssh/id_rsa -r ./docker ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          scp -i ~/.ssh/id_rsa -r ./nginx ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          
-          # Create and copy environment file
-          echo "${{ secrets.EC2_ENV }}" > .env
-          scp -i ~/.ssh/id_rsa .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-
-      - name: Deploy
+      - name: Build and Deploy
         run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
           cd ${{ env.REMOTE_DIR }}
-          
-          # Set proper permissions for nginx files
-          sudo chown -R ubuntu:ubuntu nginx
-          sudo chmod -R 755 nginx
-          
-          # Ensure SSL directory exists with proper permissions
-          sudo mkdir -p nginx/ssl
-          sudo chown -R ubuntu:ubuntu nginx/ssl
-          sudo chmod -R 600 nginx/ssl
-          
-          # Start containers
+
+          # Pull and build images
+          docker-compose pull
+          docker-compose build
+
+          # Start services
           docker-compose down --remove-orphans
           docker-compose up -d
-          
-          # Verify deployment
-          sleep 10
+
+          # Wait and verify
+          sleep 30
           if docker-compose ps | grep -q "Exit"; then
-            echo "Some containers failed to start"
+            echo "Some containers failed to start. Showing logs..."
             docker-compose logs
             exit 1
           fi
