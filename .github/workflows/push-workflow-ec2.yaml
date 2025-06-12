@@ -15,81 +15,28 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup SSH
+      - name: Setup SSH and deploy
         run: |
+          # Setup SSH
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Setup remote directory
-        run: |
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          sudo rm -rf ${{ env.REMOTE_DIR }}
-          sudo mkdir -p ${{ env.REMOTE_DIR }}
-          sudo chown ubuntu:ubuntu ${{ env.REMOTE_DIR }}
-          ENDSSH
-
-      - name: Copy repository
-        run: |
-          # Create and copy environment file
+          # Create .env file
           echo "${{ secrets.EC2_ENV }}" > .env
 
-          # Copy all directories and files
-          scp -i ~/.ssh/id_rsa -r \
-            admin_frontend \
-            assets \
-            docker \
-            email_template \
-            libs \
-            nginx \
-            services \
-            src \
-            tests \
-            docker-compose.yml \
-            Dockerfile \
-            .env \
-            Cargo.toml \
-            Cargo.lock \
-            ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          # Create directory on EC2
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} "sudo mkdir -p ${{ env.REMOTE_DIR }} && sudo chown ubuntu:ubuntu ${{ env.REMOTE_DIR }}"
 
-      - name: Set permissions
-        run: |
+          # Copy everything to EC2
+          scp -i ~/.ssh/id_rsa -r ./* ./.env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+
+          # Deploy on EC2
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
           cd ${{ env.REMOTE_DIR }}
-          
-          # Set proper permissions
-          sudo chown -R ubuntu:ubuntu .
-          sudo chmod -R 755 .
-          sudo chmod 600 .env
-          sudo chmod -R 600 nginx/ssl
-
-          # Setup docker
-          sudo groupadd -f docker
-          sudo usermod -aG docker ubuntu
-          sudo chmod 666 /var/run/docker.sock
-          ENDSSH
-
-      - name: Build and Deploy
-        run: |
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          cd ${{ env.REMOTE_DIR }}
-
-          # Pull and build images
-          docker-compose pull
-          docker-compose build
-
-          # Start services
           docker-compose down --remove-orphans
           docker-compose up -d
-
-          # Wait and verify
-          sleep 30
-          if docker-compose ps | grep -q "Exit"; then
-            echo "Some containers failed to start. Showing logs..."
-            docker-compose logs
-            exit 1
-          fi
           ENDSSH
 
       - name: Cleanup
