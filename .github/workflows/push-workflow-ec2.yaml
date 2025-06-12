@@ -24,6 +24,12 @@ jobs:
         run: |
           echo "${{ secrets.EC2_ENV }}" > .env
 
+      - name: Build gotrue image
+        run: |
+          cd docker/gotrue
+          docker build -t appflowy/gotrue:latest .
+          cd ../..
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -43,6 +49,7 @@ jobs:
         run: |
           scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
           scp -i ~/.ssh/id_rsa .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          scp -r -i ~/.ssh/id_rsa docker/gotrue ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker/
 
       - name: Deploy
         run: |
@@ -54,6 +61,11 @@ jobs:
           sudo groupadd -f docker
           sudo usermod -aG docker ubuntu
           sudo chmod 666 /var/run/docker.sock
+
+          # Build gotrue image on the server
+          cd docker/gotrue
+          docker build -t appflowy/gotrue:latest .
+          cd ../..
 
           # Pull images first to avoid downtime
           echo "Pulling new images..."
