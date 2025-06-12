@@ -41,7 +41,7 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
           # Ensure directories exist
-          sudo mkdir -p ${{ env.REMOTE_DIR }}
+          sudo mkdir -p ${{ env.REMOTE_DIR }}/docker/gotrue
           sudo chown -R ubuntu:ubuntu ${{ env.REMOTE_DIR }}
           ENDSSH
 
@@ -49,7 +49,7 @@ jobs:
         run: |
           scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
           scp -i ~/.ssh/id_rsa .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          scp -r -i ~/.ssh/id_rsa docker/gotrue ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker/
+          scp -r -i ~/.ssh/id_rsa docker/gotrue/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker/gotrue/
 
       - name: Deploy
         run: |
