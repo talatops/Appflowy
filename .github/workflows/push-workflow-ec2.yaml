@@ -24,12 +24,6 @@ jobs:
         run: |
           echo "${{ secrets.EC2_ENV }}" > .env
 
-      - name: Build gotrue image
-        run: |
-          cd docker/gotrue
-          docker build -t appflowy/gotrue:latest .
-          cd ../..
-
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -37,24 +31,17 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Prepare directories
+      - name: Copy repository to server
         run: |
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          # Ensure directories exist
-          sudo mkdir -p ${{ env.REMOTE_DIR }}/docker/gotrue
-          sudo chown -R ubuntu:ubuntu ${{ env.REMOTE_DIR }}
-          ENDSSH
-
-      - name: Copy files to server
-        run: |
-          scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          scp -i ~/.ssh/id_rsa .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          scp -r -i ~/.ssh/id_rsa docker/gotrue/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker/gotrue/
+          # Create directory if it doesn't exist
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
+          
+          # Copy entire repository and .env file
+          rsync -av --delete -e "ssh -i ~/.ssh/id_rsa" ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
 
       - name: Deploy
         run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          set -e
           cd ${{ env.REMOTE_DIR }}
 
           # Setup docker permissions
@@ -62,27 +49,14 @@ jobs:
           sudo usermod -aG docker ubuntu
           sudo chmod 666 /var/run/docker.sock
 
-          # Build gotrue image on the server
-          cd docker/gotrue
-          docker build -t appflowy/gotrue:latest .
-          cd ../..
-
-          # Pull images first to avoid downtime
-          echo "Pulling new images..."
-          docker-compose pull || { echo "Failed to pull images"; exit 1; }
-
-          # Stop existing containers
+          # Stop existing containers and start new ones
           docker-compose down --remove-orphans
-
-          # Start new containers
-          echo "Starting new containers..."
           docker-compose up -d
 
           # Wait for containers to start
-          echo "Waiting for containers to start..."
           sleep 15
 
-          # Verify deployment
+          # Check if containers are running
           if ! docker-compose ps | grep -q "Up"; then
             echo "Container verification failed!"
             exit 1
