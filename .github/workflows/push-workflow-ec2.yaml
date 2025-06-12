@@ -6,11 +6,6 @@ env:
 on:
   push:
     branches: [ main ]
-    paths-ignore:
-      - '*.md'
-      - '.gitignore'
-      - 'docs/'
-      - 'README.md'
   workflow_dispatch:
 
 jobs:
@@ -20,10 +15,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up environment
-        run: |
-          echo "${{ secrets.EC2_ENV }}" > .env
-
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -31,49 +22,56 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Copy repository to server
+      - name: Setup remote environment
         run: |
-          # Create archive of the repository
-          tar czf /tmp/appflowy.tar.gz .
-
-          # Create directory and set permissions on server
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          mkdir -p ${{ env.REMOTE_DIR }}
-          rm -rf ${{ env.REMOTE_DIR }}/*
+          # Create directory with proper permissions
+          sudo rm -rf ${{ env.REMOTE_DIR }}
+          sudo mkdir -p ${{ env.REMOTE_DIR }}
+          sudo chown ubuntu:ubuntu ${{ env.REMOTE_DIR }}
+          
+          # Setup docker
+          sudo groupadd -f docker
+          sudo usermod -aG docker ubuntu
+          sudo chmod 666 /var/run/docker.sock
           ENDSSH
 
-          # Copy and extract archive
-          scp -i ~/.ssh/id_rsa /tmp/appflowy.tar.gz ubuntu@${{ secrets.EC2_HOST }}:/tmp/
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          cd ${{ env.REMOTE_DIR }}
-          tar xzf /tmp/appflowy.tar.gz
-          rm /tmp/appflowy.tar.gz
-          ENDSSH
+      - name: Copy files
+        run: |
+          # Copy project files
+          scp -i ~/.ssh/id_rsa -r ./docker ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          scp -i ~/.ssh/id_rsa -r ./nginx ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          scp -i ~/.ssh/id_rsa docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          
+          # Create and copy environment file
+          echo "${{ secrets.EC2_ENV }}" > .env
+          scp -i ~/.ssh/id_rsa .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
 
       - name: Deploy
         run: |
           ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
           cd ${{ env.REMOTE_DIR }}
-
-          # Setup docker permissions
-          sudo groupadd -f docker
-          sudo usermod -aG docker ubuntu
-          sudo chmod 666 /var/run/docker.sock
-
-          # Stop existing containers and start new ones
+          
+          # Set proper permissions for nginx files
+          sudo chown -R ubuntu:ubuntu nginx
+          sudo chmod -R 755 nginx
+          
+          # Ensure SSL directory exists with proper permissions
+          sudo mkdir -p nginx/ssl
+          sudo chown -R ubuntu:ubuntu nginx/ssl
+          sudo chmod -R 600 nginx/ssl
+          
+          # Start containers
           docker-compose down --remove-orphans
           docker-compose up -d
-
-          # Wait for containers to start
-          sleep 15
-
-          # Check if containers are running
-          if ! docker-compose ps | grep -q "Up"; then
-            echo "Container verification failed!"
+          
+          # Verify deployment
+          sleep 10
+          if docker-compose ps | grep -q "Exit"; then
+            echo "Some containers failed to start"
+            docker-compose logs
             exit 1
           fi
-
-          echo "Deployment successful!"
           ENDSSH
 
       - name: Cleanup
@@ -81,4 +79,3 @@ jobs:
         run: |
           rm -f ~/.ssh/id_rsa
           rm -f .env
-          rm -f /tmp/appflowy.tar.gz
