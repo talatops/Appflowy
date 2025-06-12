@@ -1,0 +1,136 @@
+# Essential services for AppFlowy Cloud
+
+services:
+  nginx:
+    restart: on-failure
+    image: nginx
+    ports:
+      - ${NGINX_PORT:-8080}:80
+      - ${NGINX_TLS_PORT:-443}:443
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl/certificate.crt:/etc/nginx/ssl/certificate.crt
+      - ./nginx/ssl/private_key.key:/etc/nginx/ssl/private_key.key
+
+  # You do not need this if you have configured to use your own s3 file storage
+  minio:
+    restart: on-failure
+    image: minio/minio
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    env_file:
+      - .env
+    command: server /data --console-address "${CONSOLE_ADDRESS:-:9001}" --address ":9000"
+    volumes:
+      - minio_data:/data
+    networks:
+      - default
+
+  postgres:
+    restart: on-failure
+    image: pgvector/pgvector:pg16
+    env_file:
+      - .env
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    restart: on-failure
+    image: redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  gotrue:
+    restart: on-failure
+    build:
+      context: docker/gotrue
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: "curl --fail http://127.0.0.1:9999/health || exit 1"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    image: appflowyinc/gotrue:${GOTRUE_VERSION:-latest}
+    env_file:
+      - .env
+    environment:
+      - PORT=9999
+      - GOTRUE_API_HOST=0.0.0.0
+      - GOTRUE_SITE_URL=appflowy-flutter://
+      - GOTRUE_URI_ALLOW_LIST=**
+      - GOTRUE_JWT_ADMIN_GROUP_NAME=supabase_admin
+      - GOTRUE_DB_DRIVER=postgres
+      - GOTRUE_MAILER_URLPATHS_CONFIRMATION=/gotrue/verify
+      - GOTRUE_MAILER_URLPATHS_INVITE=/gotrue/verify
+      - GOTRUE_MAILER_URLPATHS_RECOVERY=/gotrue/verify
+      - GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE=/gotrue/verify
+
+  appflowy_cloud:
+    restart: on-failure
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FEATURES: ""
+    image: appflowyinc/appflowy_cloud:${APPFLOWY_CLOUD_VERSION:-latest}
+    depends_on:
+      gotrue:
+        condition: service_healthy
+
+  admin_frontend:
+    restart: on-failure
+    build:
+      context: .
+      dockerfile: ./admin_frontend/Dockerfile
+    image: appflowyinc/admin_frontend:${APPFLOWY_ADMIN_FRONTEND_VERSION:-latest}
+    env_file:
+      - .env
+    depends_on:
+      gotrue:
+        condition: service_healthy
+      appflowy_cloud:
+        condition: service_started
+
+  ai:
+    restart: on-failure
+    image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  appflowy_worker:
+    restart: on-failure
+    image: appflowyinc/appflowy_worker:${APPFLOWY_WORKER_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: ./services/appflowy-worker/Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  appflowy_web:
+    restart: on-failure
+    image: appflowyinc/appflowy_web:${APPFLOWY_WEB_VERSION:-latest}
+    depends_on:
+      - appflowy_cloud
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
