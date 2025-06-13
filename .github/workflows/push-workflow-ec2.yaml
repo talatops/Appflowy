@@ -1,6 +1,8 @@
-name: Deploy AppFlowy Cloud
+name: build-deploy-appflowy
 
 env:
+  IMAGE_NAME: appflowy-cloud
+  CONTAINER_NAME: appflowy-cloud
   REMOTE_DIR: /home/ubuntu/appflowy
 
 on:
@@ -14,7 +16,7 @@ on:
       - 'README.md'
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
 
@@ -24,79 +26,111 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Create .env file
+      - name: Set up environment
         run: |
           echo "${{ secrets.EC2_ENV }}" > .env
+          echo "IMAGE_NAME=${{ env.IMAGE_NAME }}" >> .env
+          echo "CONTAINER_NAME=${{ env.CONTAINER_NAME }}" >> .env
+
+      - name: Clean up unused Docker resources
+        run: docker system prune -af
 
       - name: Build Docker images
         run: |
           # Build all images defined in docker-compose.yml
           docker-compose build
-          
-          # Save images to tar files
-          mkdir -p docker-images
-          docker save appflowyinc/appflowy_cloud:latest -o docker-images/appflowy_cloud.tar
-          docker save appflowyinc/gotrue:latest -o docker-images/gotrue.tar
-          docker save appflowyinc/admin_frontend:latest -o docker-images/admin_frontend.tar
-          docker save appflowyinc/appflowy_web:latest -o docker-images/appflowy_web.tar
-          docker save appflowyinc/appflowy_ai:latest -o docker-images/appflowy_ai.tar
-          docker save appflowyinc/appflowy_worker:latest -o docker-images/appflowy_worker.tar
-          docker save minio/minio:latest -o docker-images/minio.tar
-          docker save pgvector/pgvector:pg16 -o docker-images/postgres.tar
-          docker save redis:latest -o docker-images/redis.tar
-          docker save nginx:latest -o docker-images/nginx.tar
+          docker images
 
-      - name: Deploy to server
+      - name: Save Docker images
         run: |
-          # Create directory on server if it doesn't exist
-          ssh ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
+          mkdir -p docker-images
+          # Save and compress each image
+          for service in appflowy_cloud gotrue admin_frontend appflowy_web appflowy_ai appflowy_worker; do
+            docker save appflowyinc/${service}:latest | gzip > docker-images/${service}.tar.gz
+          done
+          # Save third-party images
+          docker save minio/minio:latest | gzip > docker-images/minio.tar.gz
+          docker save pgvector/pgvector:pg16 | gzip > docker-images/postgres.tar.gz
+          docker save redis:latest | gzip > docker-images/redis.tar.gz
+          docker save nginx:latest | gzip > docker-images/nginx.tar.gz
           
-          # Copy only changed files using rsync (much faster than scp)
-          rsync -avz --delete --exclude '.git' --exclude '.github' --exclude '.env' --exclude '.docker.env' --exclude 'docker-images' ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          # List all saved images
+          ls -lh docker-images/
+
+      - name: Setup SSH
+        run: |
+          echo "${{ secrets.EC2_KEY }}" >> id_rsa
+          chmod 400 id_rsa
+
+      - name: Copy files to server
+        run: |
+          ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          sudo rm -rf ${{ env.REMOTE_DIR }}
+          sudo mkdir -p ${{ env.REMOTE_DIR }}
+          sudo chown -R ubuntu:ubuntu ${{ env.REMOTE_DIR }}
+          ENDSSH
           
-          # Copy .env file separately
-          scp .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          # Copy project files excluding unnecessary ones
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.env' \
+            --exclude '.docker.env' \
+            --exclude 'docker-images' \
+            ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
           
-          # Create directory for Docker images on server
-          ssh ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}/docker-images"
-          
-          # Copy Docker images to server
-          scp -r docker-images/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker-images/
-          
-          # Deploy on server
-          ssh ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          # Copy Docker images and config files
+          scp -i id_rsa -o StrictHostKeyChecking=no -r docker-images/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          scp -i id_rsa -o StrictHostKeyChecking=no docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          scp -i id_rsa -o StrictHostKeyChecking=no .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+
+      - name: Deploy with rollback
+        run: |
+          ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          set -e
           cd ${{ env.REMOTE_DIR }}
           
-          # Ensure docker is running and user has permissions
-          sudo systemctl start docker || true
-          sudo usermod -aG docker ubuntu || true
+          # Setup docker permissions
+          sudo groupadd -f docker
+          sudo usermod -aG docker ubuntu
+          sudo chmod 666 /var/run/docker.sock
           
-          # Create required directories
+          # Create required directories with proper permissions
           sudo mkdir -p nginx/ssl
           sudo chown -R ubuntu:ubuntu .
           
-          # Stop existing containers
-          sudo docker-compose down --remove-orphans || true
+          # Clean up existing containers and volumes
+          sudo docker-compose down -v || true
+          sudo docker system prune -af || true
           
-          # Load Docker images from tar files
-          echo "Loading Docker images..."
-          for image in docker-images/*.tar; do
-            echo "Loading $image..."
-            sudo docker load -i "$image"
+          # Remove existing images
+          for service in appflowy_cloud gotrue admin_frontend appflowy_web appflowy_ai appflowy_worker minio postgres redis nginx; do
+            sudo docker rmi $(basename $service):latest || true
           done
-          
-          # Start containers
-          echo "Starting containers..."
+
+          # Load new images
+          echo "Loading Docker images..."
+          for image in *.tar.gz; do
+            echo "Loading $image..."
+            sudo gunzip -c $image | sudo docker load
+          done
+
+          # Ensure docker-compose is installed
+          if ! command -v docker-compose &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y docker-compose
+          fi
+
+          # Deploy with docker-compose
           sudo docker-compose up -d
           
-          # Check if containers are running
+          # Wait for containers to start
+          sleep 10
+          
+          # Verify deployment
           if ! sudo docker-compose ps | grep -q "Up"; then
             echo "Deployment failed, containers are not running"
             sudo docker-compose logs
@@ -109,6 +143,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          rm -f ~/.ssh/id_rsa
+          rm -f id_rsa
           rm -f .env
           rm -rf docker-images
+          docker system prune -f
