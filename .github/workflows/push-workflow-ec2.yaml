@@ -1,14 +1,12 @@
-name: build-deploy-development
+name: Deploy AppFlowy Cloud
 
 env:
-  IMAGE_NAME: appflowy-cloud
-  CONTAINER_NAME: appflowy-cloud
   REMOTE_DIR: /home/ubuntu/appflowy
 
 on:
   workflow_dispatch:
   push:
-    branches: dev
+    branches: [ dev ]
     paths-ignore:
       - '*.md'
       - '.gitignore'
@@ -16,61 +14,58 @@ on:
       - 'README.md'
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup SSH
         run: |
-          echo "${{ secrets.EC2_KEY }}" >> id_rsa
-          chmod 400 id_rsa
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Copy files to server
+      - name: Create .env file
         run: |
-          # Create directory and set permissions
-          ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          sudo rm -rf ${{ env.REMOTE_DIR }}
-          sudo mkdir -p ${{ env.REMOTE_DIR }}
-          sudo chown -R ubuntu:ubuntu ${{ env.REMOTE_DIR }}
-          ENDSSH
+          echo "${{ secrets.EC2_ENV }}" > .env
 
-          # Copy project files
-          scp -i id_rsa -o StrictHostKeyChecking=no -r ./* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+      - name: Deploy to server
+        run: |
+          # Create directory on server if it doesn't exist
+          ssh ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
           
-          # Copy env file
-          echo -e "${{ secrets.EC2_ENV }}" > .env
-          scp -i id_rsa -o StrictHostKeyChecking=no .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-
-      - name: Deploy with rollback
-        run: |
-          ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-          set -e
+          # Copy only changed files using rsync (much faster than scp)
+          rsync -avz --delete --exclude '.git' --exclude '.github' --exclude '.env' --exclude '.docker.env' ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          
+          # Copy .env file separately
+          scp .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          
+          # Deploy on server
+          ssh ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
           cd ${{ env.REMOTE_DIR }}
           
-          # Setup docker permissions
-          sudo groupadd -f docker
-          sudo usermod -aG docker ubuntu
-          sudo chmod 666 /var/run/docker.sock
+          # Ensure docker is running and user has permissions
+          sudo systemctl start docker || true
+          sudo usermod -aG docker ubuntu || true
           
-          # Create required directories with proper permissions
+          # Create required directories
           sudo mkdir -p nginx/ssl
           sudo chown -R ubuntu:ubuntu .
           
-          # Clean up existing containers and volumes
+          # Stop existing containers
           sudo docker-compose down --remove-orphans || true
-          sudo docker system prune -af || true
           
-          # Build and deploy with docker-compose
-          sudo docker-compose build --no-cache
+          # Pull latest images and start containers
+          sudo docker-compose pull
           sudo docker-compose up -d
           
-          # Wait for containers to start
-          sleep 10
-          
-          # Verify deployment
+          # Check if containers are running
           if ! sudo docker-compose ps | grep -q "Up"; then
             echo "Deployment failed, containers are not running"
             sudo docker-compose logs
@@ -83,5 +78,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          rm -f id_rsa
+          rm -f ~/.ssh/id_rsa
           rm -f .env
