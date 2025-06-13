@@ -16,7 +16,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -35,16 +35,40 @@ jobs:
         run: |
           echo "${{ secrets.EC2_ENV }}" > .env
 
+      - name: Build Docker images
+        run: |
+          # Build all images defined in docker-compose.yml
+          docker-compose build
+          
+          # Save images to tar files
+          mkdir -p docker-images
+          docker save appflowyinc/appflowy_cloud:latest -o docker-images/appflowy_cloud.tar
+          docker save appflowyinc/gotrue:latest -o docker-images/gotrue.tar
+          docker save appflowyinc/admin_frontend:latest -o docker-images/admin_frontend.tar
+          docker save appflowyinc/appflowy_web:latest -o docker-images/appflowy_web.tar
+          docker save appflowyinc/appflowy_ai:latest -o docker-images/appflowy_ai.tar
+          docker save appflowyinc/appflowy_worker:latest -o docker-images/appflowy_worker.tar
+          docker save minio/minio:latest -o docker-images/minio.tar
+          docker save pgvector/pgvector:pg16 -o docker-images/postgres.tar
+          docker save redis:latest -o docker-images/redis.tar
+          docker save nginx:latest -o docker-images/nginx.tar
+
       - name: Deploy to server
         run: |
           # Create directory on server if it doesn't exist
           ssh ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
           
           # Copy only changed files using rsync (much faster than scp)
-          rsync -avz --delete --exclude '.git' --exclude '.github' --exclude '.env' --exclude '.docker.env' ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          rsync -avz --delete --exclude '.git' --exclude '.github' --exclude '.env' --exclude '.docker.env' --exclude 'docker-images' ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
           
           # Copy .env file separately
           scp .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          
+          # Create directory for Docker images on server
+          ssh ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}/docker-images"
+          
+          # Copy Docker images to server
+          scp -r docker-images/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker-images/
           
           # Deploy on server
           ssh ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
@@ -61,8 +85,15 @@ jobs:
           # Stop existing containers
           sudo docker-compose down --remove-orphans || true
           
-          # Pull latest images and start containers
-          sudo docker-compose pull
+          # Load Docker images from tar files
+          echo "Loading Docker images..."
+          for image in docker-images/*.tar; do
+            echo "Loading $image..."
+            sudo docker load -i "$image"
+          done
+          
+          # Start containers
+          echo "Starting containers..."
           sudo docker-compose up -d
           
           # Check if containers are running
@@ -80,3 +111,4 @@ jobs:
         run: |
           rm -f ~/.ssh/id_rsa
           rm -f .env
+          rm -rf docker-images
