@@ -29,6 +29,12 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set up Docker Compose
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker-compose-plugin
+          docker compose version
+
       - name: Set up environment
         run: |
           echo "${{ secrets.EC2_ENV }}" > .env
@@ -41,7 +47,7 @@ jobs:
       - name: Build Docker images
         run: |
           # Build all images defined in docker-compose.yml
-          docker-compose build
+          docker compose build --no-cache
           docker images
 
       - name: Save Docker images
@@ -103,7 +109,7 @@ jobs:
           sudo chown -R ubuntu:ubuntu .
           
           # Clean up existing containers and volumes
-          sudo docker-compose down -v || true
+          sudo docker compose down -v || true
           sudo docker system prune -af || true
           
           # Remove existing images
@@ -118,22 +124,16 @@ jobs:
             sudo gunzip -c $image | sudo docker load
           done
 
-          # Ensure docker-compose is installed
-          if ! command -v docker-compose &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y docker-compose
-          fi
-
           # Deploy with docker-compose
-          sudo docker-compose up -d
+          sudo docker compose up -d
           
           # Wait for containers to start
           sleep 10
           
           # Verify deployment
-          if ! sudo docker-compose ps | grep -q "Up"; then
+          if ! sudo docker compose ps | grep -q "Up"; then
             echo "Deployment failed, containers are not running"
-            sudo docker-compose logs
+            sudo docker compose logs
             exit 1
           fi
           
