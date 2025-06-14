@@ -84,13 +84,19 @@ jobs:
 
       - name: Copy files to server
         run: |
+          # First, create the remote directory structure
           ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
           sudo rm -rf ${{ env.REMOTE_DIR }}
           sudo mkdir -p ${{ env.REMOTE_DIR }}
           sudo chown -R ubuntu:ubuntu ${{ env.REMOTE_DIR }}
+          mkdir -p ${{ env.REMOTE_DIR }}/docker-images
           ENDSSH
-          
-          # Copy project files excluding unnecessary ones
+
+          # Create a temporary directory for the transfer
+          TEMP_DIR=$(mktemp -d)
+          cp -r . $TEMP_DIR/
+          cd $TEMP_DIR
+
           # Create tar archive excluding unwanted files
           tar --exclude='.git' \
               --exclude='.github' \
@@ -98,17 +104,23 @@ jobs:
               --exclude='.docker.env' \
               --exclude='docker-images' \
               --exclude='id_rsa' \
+              --exclude='deploy.tar.gz' \
               -czf deploy.tar.gz .
 
-          # Copy the archive and extract it on the remote server
-          scp -i id_rsa -o StrictHostKeyChecking=no deploy.tar.gz ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
-          ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} "cd ${{ env.REMOTE_DIR }} && tar xzf deploy.tar.gz && rm deploy.tar.gz"
+          # Copy the archive and extract it
+          scp -i ../id_rsa -o StrictHostKeyChecking=no deploy.tar.gz ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          ssh -i ../id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} "cd ${{ env.REMOTE_DIR }} && tar xzf deploy.tar.gz && rm deploy.tar.gz"
 
-          # Copy Docker images and config files
-          ssh -i id_rsa -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}/docker-images"
-          scp -i id_rsa -o StrictHostKeyChecking=no -r docker-images/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker-images/
+          # Copy Docker images
+          cd ..
+          scp -i id_rsa -o StrictHostKeyChecking=no docker-images/*.tar.gz ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/docker-images/
+          
+          # Copy config files
           scp -i id_rsa -o StrictHostKeyChecking=no docker-compose.yml ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
           scp -i id_rsa -o StrictHostKeyChecking=no .env ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+
+          # Cleanup temporary directory
+          rm -rf $TEMP_DIR
 
       - name: Deploy with rollback
         run: |
@@ -130,16 +142,15 @@ jobs:
           sudo docker system prune -af || true
           
           # Remove existing images
-          for service in appflowy_cloud gotrue admin_frontend appflowy_web appflowy_ai appflowy_worker minio postgres redis nginx; do
-            sudo docker rmi $(basename $service):latest || true
-          done
-
+          docker images -q | xargs -r docker rmi -f
+          
           # Load new images
           echo "Loading Docker images..."
           cd docker-images
           for image in *.tar.gz; do
+            [ -f "$image" ] || continue  # Skip if no files match
             echo "Loading $image..."
-            sudo gunzip -c $image | sudo docker load
+            sudo gunzip -c "$image" | sudo docker load
           done
           cd ..
 
@@ -147,7 +158,7 @@ jobs:
           sudo docker compose up -d
           
           # Wait for containers to start
-          sleep 10
+          sleep 30
           
           # Verify deployment
           if ! sudo docker compose ps | grep -q "Up"; then
