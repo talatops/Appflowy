@@ -91,13 +91,19 @@ jobs:
           ENDSSH
           
           # Copy project files excluding unnecessary ones
-          rsync -avz --delete \
-            --exclude '.git' \
-            --exclude '.github' \
-            --exclude '.env' \
-            --exclude '.docker.env' \
-            --exclude 'docker-images' \
-            ./ ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          # Create a temporary exclude file
+          echo ".git" > exclude.txt
+          echo ".github" >> exclude.txt
+          echo ".env" >> exclude.txt
+          echo ".docker.env" >> exclude.txt
+          echo "docker-images" >> exclude.txt
+          
+          # Use scp with the exclude file
+          scp -r -o StrictHostKeyChecking=no $(cat exclude.txt | while read line; do echo "-E $line"; done) \
+            ./* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
+          
+          # Clean up
+          rm exclude.txt
           
           # Copy Docker images and config files
           scp -i id_rsa -o StrictHostKeyChecking=no -r docker-images/* ubuntu@${{ secrets.EC2_HOST }}:${{ env.REMOTE_DIR }}/
